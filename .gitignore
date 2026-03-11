@@ -4,7 +4,8 @@ node_modules
 dist
 .env
 .env.local
-.env.example
+backend/.env.example
+frontend/.env.example
 coverage
 .DS_Store
 .vscode
