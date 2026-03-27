@@ -2,16 +2,252 @@ import { Injectable, NotFoundException } from "@nestjs/common";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { CreateVenueDto } from "./dto/create-venue.dto";
 import { UpdateVenueDto } from "./dto/update-venue.dto";
+import { EnrichmentService } from "../enrichment/enrichment.service";
 
 @Injectable()
 export class VenuesService {
   private supabase: SupabaseClient;
 
-  constructor() {
+  constructor(private enrichmentService: EnrichmentService) {
     this.supabase = createClient(
       process.env.SUPABASE_URL!,
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
     );
+  }
+
+  private async findEmailViaGoogle(
+    name: string,
+    city?: string,
+  ): Promise<string | null> {
+    try {
+      const query = `"${name}" ${city || ""} email`;
+      const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        },
+      });
+
+      const html = await response.text();
+
+      const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+      const matches = html.match(emailRegex);
+
+      if (!matches) return null;
+
+      const filtered = matches.find(
+        (e) =>
+          !e.includes("example") &&
+          !e.includes("google") &&
+          !e.includes("sentry"),
+      );
+
+      return filtered || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async findEmailViaSocial(
+    name: string,
+    city?: string,
+  ): Promise<string | null> {
+    try {
+      const queries = [
+        `site:instagram.com "${name}" ${city || ""} email`,
+        `site:facebook.com "${name}" ${city || ""} email`,
+      ];
+
+      for (const q of queries) {
+        const url = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+
+        const response = await fetch(url, {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+          },
+        });
+
+        const html = await response.text();
+
+        const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+
+        const matches = html.match(emailRegex);
+
+        if (!matches) continue;
+
+        const filtered = matches.find(
+          (e) =>
+            !e.includes("example") &&
+            !e.includes("google") &&
+            !e.includes("sentry"),
+        );
+
+        if (filtered) return filtered;
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async findEmailViaGoogleMaps(
+    mapsUrl?: string,
+  ): Promise<string | null> {
+    if (!mapsUrl) return null;
+
+    try {
+      const response = await fetch(mapsUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        },
+      });
+
+      const html = await response.text();
+
+      const mailtoMatch = html.match(
+        /mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/,
+      );
+      if (mailtoMatch) return mailtoMatch[1];
+
+      const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+      const matches = html.match(emailRegex);
+
+      if (!matches) return null;
+
+      const filtered = matches.find(
+        (e) =>
+          !e.includes("example") &&
+          !e.includes("google") &&
+          !e.includes("sentry"),
+      );
+
+      return filtered || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async findEmail(id: string) {
+    const venue = await this.findOne(id);
+
+    if (!venue) {
+      throw new Error("Venue not found");
+    }
+
+    let email: string | null = venue.email || null;
+
+    // Try extracting email from Google Maps page
+    if (!email && venue.google_maps_url) {
+      try {
+        const mapsEmail = await this.findEmailViaGoogleMaps(
+          venue.google_maps_url,
+        );
+        if (mapsEmail) email = mapsEmail;
+      } catch {}
+    }
+
+    if (!email && venue.website) {
+      try {
+        const enriched = await this.enrichmentService.enrichFromWebsite(
+          venue.website,
+        );
+        email = enriched.email || null;
+      } catch {}
+    }
+
+    // Try Google search enrichment if still no email
+    if (!email && venue.name) {
+      try {
+        const googleEmail = await this.findEmailViaGoogle(
+          venue.name,
+          venue.city,
+        );
+        if (googleEmail) email = googleEmail;
+      } catch {}
+    }
+
+    // Try social network enrichment
+    if (!email && venue.name) {
+      try {
+        const socialEmail = await this.findEmailViaSocial(
+          venue.name,
+          venue.city,
+        );
+        if (socialEmail) email = socialEmail;
+      } catch {}
+    }
+
+    if (email) {
+      await this.supabase.from("venues").update({ email }).eq("id", id);
+    }
+
+    return { email };
+  }
+
+  async reenrichIncompleteVenues() {
+    const { data: venues } = await this.supabase
+      .from("venues")
+      .select("*")
+      .or("email.is.null,instagram.is.null,facebook.is.null");
+
+    if (!venues?.length) return { processed: 0 };
+
+    const BATCH_SIZE = 5; // nombre de scrapes en parallèle
+    let processed = 0;
+
+    for (let i = 0; i < venues.length; i += BATCH_SIZE) {
+      const batch = venues.slice(i, i + BATCH_SIZE);
+
+      await Promise.all(
+        batch.map(async (venue) => {
+          try {
+            await this.reenrichVenue(venue.id);
+            processed++;
+          } catch (err) {
+            console.error("Erreur reenrich venue", venue.id);
+          }
+        }),
+      );
+    }
+
+    return { processed };
+  }
+
+  async reenrichVenue(id: string) {
+    const venue = await this.findOne(id);
+
+    if (!venue) throw new Error("Venue not found");
+
+    let enriched: any = {};
+
+    if (venue.website) {
+      try {
+        enriched = await this.enrichmentService.enrichFromWebsite(
+          venue.website,
+        );
+      } catch {}
+    }
+
+    let instagram = venue.instagram || enriched.instagram || null;
+    let facebook = venue.facebook || enriched.facebook || null;
+    let email = venue.email || enriched.email || null;
+
+    await this.supabase
+      .from("venues")
+      .update({
+        instagram,
+        facebook,
+        email,
+        updated_at: new Date(),
+      })
+      .eq("id", id);
+
+    return { success: true };
   }
 
   async findAll(filters?: {

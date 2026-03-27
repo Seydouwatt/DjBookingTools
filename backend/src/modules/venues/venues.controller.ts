@@ -54,6 +54,21 @@ export class VenuesController {
     return this.venuesService.create(dto);
   }
 
+  @Post(":id/reenrich")
+  async reenrich(@Param("id") id: string) {
+    return this.venuesService.reenrichVenue(id);
+  }
+
+  @Post("reenrich-incomplete")
+  async reenrichIncomplete() {
+    return this.venuesService.reenrichIncompleteVenues();
+  }
+
+  @Post(":id/find-email")
+  async findEmail(@Param("id") id: string) {
+    return this.venuesService.findEmail(id);
+  }
+
   @Put(":id")
   update(@Param("id") id: string, @Body() dto: UpdateVenueDto) {
     return this.venuesService.update(id, dto);

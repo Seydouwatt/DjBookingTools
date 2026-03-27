@@ -48,6 +48,43 @@ function classifyVenue(name: string, category?: string): string {
   return "bar";
 }
 
+// Try to discover Instagram using a Google search
+async function findInstagramViaGoogle(
+  page: any,
+  name: string,
+  city: string,
+): Promise<string | null> {
+  try {
+    const query = `site:instagram.com "${name}" ${city}`;
+    const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+
+    const link = await page.evaluate(() => {
+      const anchors = Array.from(
+        document.querySelectorAll("a"),
+      ) as HTMLAnchorElement[];
+
+      for (const a of anchors) {
+        const href = a.href || "";
+
+        if (href.includes("instagram.com/") && !href.includes("/p/")) {
+          const match = href.match(/instagram\.com\/([^/?#]+)/);
+          if (match && match[1]) {
+            return `https://instagram.com/${match[1]}`;
+          }
+        }
+      }
+
+      return null;
+    });
+
+    return link;
+  } catch {
+    return null;
+  }
+}
+
 @Injectable()
 export class ScraperService {
   private currentJob: ScraperJob | null = null;
@@ -125,6 +162,24 @@ export class ScraperService {
       const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(searchQuery)}`;
 
       await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 30000 });
+      try {
+        await page.waitForSelector("button", { timeout: 5000 });
+
+        const buttons = await page.$$("button");
+
+        for (const button of buttons) {
+          const text = await page.evaluate((el) => el.innerText, button);
+
+          if (text.includes("Tout accepter") || text.includes("Accept all")) {
+            await button.click();
+            console.log("Cookies acceptés");
+            break;
+          }
+        }
+      } catch (e) {
+        console.log("Pas de popup cookies");
+      }
+
       await randomDelay(2000, 4000);
 
       // Scroll to load more results
@@ -163,14 +218,15 @@ export class ScraperService {
       const toProcess = placeLinks.slice(0, job.limit);
       const venues: any[] = [];
 
+      // Reuse a single tab for venue details (much faster than opening one per venue)
+      const detailPage = await browser.newPage();
+      await detailPage.setUserAgent(randomUserAgent());
+
       for (let i = 0; i < toProcess.length; i++) {
         const link = toProcess[i];
         job.progress = Math.round((i / toProcess.length) * 100);
 
         try {
-          const detailPage = await browser.newPage();
-          await detailPage.setUserAgent(randomUserAgent());
-
           const fullUrl = link.startsWith("http")
             ? link
             : `https://www.google.com${link}`;
@@ -178,6 +234,12 @@ export class ScraperService {
             waitUntil: "networkidle2",
             timeout: 20000,
           });
+
+          // wait for main content to load (name or address)
+          try {
+            await detailPage.waitForSelector("h1", { timeout: 8000 });
+          } catch {}
+
           await randomDelay(1000, 2500);
 
           const venueData = await detailPage.evaluate(() => {
@@ -191,12 +253,16 @@ export class ScraperService {
             const phone =
               getText('[data-item-id*="phone"] .fontBodyMedium') ||
               getText('[data-tooltip*="phone"] .fontBodyMedium');
-            const website =
-              (
-                document.querySelector(
-                  '[data-item-id="authority"] a',
-                ) as HTMLAnchorElement
-              )?.href || "";
+
+            let website = "";
+            const websiteEl = document.querySelector(
+              'a[data-item-id="authority"], a[data-tooltip="Open website"], a[data-tooltip="Ouvrir le site Web"]',
+            ) as HTMLAnchorElement | null;
+
+            if (websiteEl && websiteEl.href) {
+              website = websiteEl.href;
+            }
+
             const ratingText = getText(".F7nice span[aria-hidden]");
             const rating = ratingText
               ? parseFloat(ratingText.replace(",", "."))
@@ -212,11 +278,32 @@ export class ScraperService {
             const category =
               getText(".DkEaL") || getText(".mgr77e .fontBodyMedium");
 
+            const anchors = Array.from(
+              document.querySelectorAll("a"),
+            ) as HTMLAnchorElement[];
+
+            let instagram = "";
+            let facebook = "";
+
+            for (const a of anchors) {
+              const href = a.href || "";
+
+              if (!instagram && href.includes("instagram.com")) {
+                instagram = href;
+              }
+
+              if (!facebook && href.includes("facebook.com")) {
+                facebook = href;
+              }
+            }
+
             return {
               name,
               address,
               phone,
               website,
+              instagram,
+              facebook,
               rating,
               reviews_count,
               category,
@@ -231,11 +318,30 @@ export class ScraperService {
             const city = cityMatch ? cityMatch[1].trim() : job.city;
 
             let enriched: any = {};
+
+            // If we already captured socials from Google Maps keep them
             if (venueData.website) {
               try {
                 enriched = await this.enrichmentService.enrichFromWebsite(
                   venueData.website,
                 );
+              } catch {}
+            }
+
+            let instagram = venueData.instagram || enriched.instagram || null;
+            const facebook = venueData.facebook || enriched.facebook || null;
+
+            // If no Instagram found yet, try Google search enrichment
+            if (!instagram && venueData.name) {
+              try {
+                const foundInsta = await findInstagramViaGoogle(
+                  detailPage,
+                  venueData.name,
+                  city,
+                );
+                if (foundInsta) instagram = foundInsta;
+
+                await randomDelay(1200, 2500);
               } catch {}
             }
 
@@ -246,6 +352,8 @@ export class ScraperService {
               postal_code,
               phone: venueData.phone,
               website: venueData.website,
+              instagram,
+              facebook,
               google_maps_url: fullUrl,
               rating: venueData.rating,
               reviews_count: venueData.reviews_count,
@@ -256,12 +364,13 @@ export class ScraperService {
             job.found++;
           }
 
-          await detailPage.close();
           await randomDelay(2000, 4000);
         } catch {
           // skip this venue
         }
       }
+
+      await detailPage.close();
 
       if (venues.length > 0) {
         await this.venuesService.bulkInsert(venues);
